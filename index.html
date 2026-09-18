@@ -197,11 +197,6 @@ input[type=color]{padding:0;height:20px;border:1px solid var(--line2);background
 .fxrow{border:1px solid var(--line);border-radius:4px;padding:5px;margin-bottom:5px;background:var(--panel2)}
 .fxrow>.h{display:flex;align-items:center;gap:5px;margin-bottom:4px}
 .fxrow>.h b{flex:1}
-
-/* サイズドラッグ中はブラウザの選択・ジェスチャーを抑え、Canvasの座標追従を優先 */
-#overlay, #viewport { user-select:none; -webkit-user-select:none; touch-action:none; }
-body.is-object-scaling { user-select:none !important; -webkit-user-select:none !important; cursor:crosshair !important; }
-body.is-object-scaling * { user-select:none !important; }
 </style>
 </head>
 <body>
@@ -468,7 +463,7 @@ function newScene(name) {
   return {
     id: uid('sc'), name: name || 'シーン',
     duration: 10, objects: [], markers: [], audio: [],
-    camera: { props: { camx: 0, camy: 0, zoom: 1, shake: 0 }, tracks: {}, id: 'camera' },
+    camera: { props: { camx: 0, camy: 0, zoom: 1, camrot: 0, shake: 0 }, tracks: {}, id: 'camera' },
     bg: '#1a1a1e', bgTransparent: false
   };
 }
@@ -1061,7 +1056,7 @@ async function deserializeProject(data, withMedia) {
       o.props = o.props || {}; o.tracks = o.tracks || {}; o.effects = o.effects || []; o.frames = o.frames || [];
       Object.keys(o.tracks).forEach(k => { if (!Array.isArray(o.tracks[k])) delete o.tracks[k]; else o.tracks[k].sort((a, b) => a.t - b.t); });
     });
-    sc.camera = sc.camera || { props: { camx: 0, camy: 0, zoom: 1, shake: 0 }, tracks: {} };
+    sc.camera = sc.camera || { props: { camx: 0, camy: 0, zoom: 1, camrot: 0, shake: 0 }, tracks: {} };
     sc.audio = sc.audio || []; sc.markers = sc.markers || [];
   });
   if (withMedia) {
@@ -1091,7 +1086,7 @@ const History = {
     this.stack.push({ label: label || '編集', s: s, sel: State.selection.slice(), time: State.time });
     if (this.stack.length > this.max) this.stack.shift();
     this.idx = this.stack.length - 1;
-    State.dirty = true; updateSaveState(); AutoSave.scheduleQuick();
+    State.dirty = true; updateSaveState();
   },
   async apply(e) {
     this.busy = true;
@@ -1146,35 +1141,26 @@ const DB = {
 };
 
 const AutoSave = {
-  timer: null, interval: 60000, last: 0, enabled: true, pending: null, quickTimer: null,
+  timer: null, interval: 60000, last: 0, enabled: true,
   start() { clearInterval(this.timer); this.timer = setInterval(() => this.run(), this.interval); },
-  scheduleQuick() {
-    if (!this.enabled || !P()) return;
-    clearTimeout(this.quickTimer);
-    this.quickTimer = setTimeout(() => this.run(), 3000);
-  },
   async run(force) {
     if (!this.enabled || !P()) return;
     if (!State.dirty && !force) return;
-    if (this.pending) return this.pending;
-    this.pending = (async () => {
-      try {
-        const data = serializeProject(true);
-        const now = Date.now();
-        await DB.put('autosave', { at: now, name: P().name, data: data });
-        const backups = (await DB.get('backups')) || [];
-        if (force || now - this.last > 5 * 60000) {
-          backups.unshift({ at: now, name: P().name, data: data });
-          while (backups.length > 5) backups.pop();
-          await DB.put('backups', backups);
-          this.last = now;
-        }
-        $('#savestate').textContent = '自動保存 ' + new Date(now).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
-      } catch (e) {
-        Toast.warn('自動保存に失敗しました', '保存領域が不足している可能性があります。ファイル→プロジェクトを保存 で手元に保存してください。');
-      } finally { this.pending = null; }
-    })();
-    return this.pending;
+    try {
+      const data = serializeProject(true);
+      await DB.put('autosave', { at: Date.now(), name: P().name, data: data });
+      const backups = (await DB.get('backups')) || [];
+      if (Date.now() - this.last > 5 * 60000) {
+        backups.unshift({ at: Date.now(), name: P().name, data: data });
+        while (backups.length > 5) backups.pop();
+        await DB.put('backups', backups);
+        this.last = Date.now();
+      }
+      $('#savestate').textContent = '自動保存 ' + new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+      Toast.warn('自動保存に失敗しました', '保存領域が不足している可能性があります。ファイル→プロジェクトを保存 で手元に保存してください。');
+      this.enabled = false;
+    }
   }
 };
 
@@ -1475,7 +1461,7 @@ const Canvas = {
     const corner = [['nw', 0, 0], ['n', .5, 0], ['ne', 1, 0], ['e', 1, .5], ['se', 1, 1], ['s', .5, 1], ['sw', 0, 1], ['w', 0, .5]];
     const out = corner.map(c => { const w = M.apply(dm, c[1] * sz.w, c[2] * sz.h); const s = this.w2s(w.x, w.y); return { k: c[0], x: s.x, y: s.y }; });
     const n = M.apply(dm, sz.w / 2, -34 / Math.max(.05, State.zoom)); const ns = this.w2s(n.x, n.y);
-    out.push({ k: 'rot_removed', x: ns.x, y: ns.y });
+    out.push({ k: 'rot', x: ns.x, y: ns.y });
     return out;
   },
 
@@ -1631,43 +1617,14 @@ const Canvas = {
         const hs = this.handlePositions(o, State.time);
         for (const h of hs) {
           if (Math.abs(h.x - sx) < 7 && Math.abs(h.y - sy) < 7) {
-            const t0 = State.time;
-            const sz0 = objSize(o);
-            const sx0 = getProp(o, 'sx', t0);
-            const sy0 = getProp(o, 'sy', t0);
-            const ax0 = getProp(o, 'ax', t0);
-            const ay0 = getProp(o, 'ay', t0);
-            // スケール計算専用の「基準行列」。
-            // オブジェクト自身の拡大縮小だけを除き、親・位置・回転・スキューは固定する。
-            // これをドラッグ中ずっと使うことで、現在のscaleを再び座標変換に入れる
-            // フィードバックループを防ぎ、マウス座標が伸びる方向へずれる問題を解消する。
-            let parentBase = M.id();
-            const par0 = o.parentId ? objById(o.parentId) : null;
-            if (par0) {
-              parentBase = worldMatrix(par0, t0);
-              if (par0.type === 'bone') parentBase = M.mul(parentBase, M.translate(getProp(par0, 'len', t0), 0));
-            }
-            const ox0 = getProp(o, 'x', t0), oy0 = getProp(o, 'y', t0);
-            const r0 = rad(getProp(o, 'rot', t0));
-            const kx0 = rad(getProp(o, 'skx', t0)), ky0 = rad(getProp(o, 'sky', t0));
-            let base = M.translate(ox0, oy0);
-            base = M.mul(base, M.rotate(r0));
-            base = M.mul(base, M.skew(kx0, ky0));
-            base = M.mul(parentBase, base);
-            const invBase = M.invert(base);
-            // 各ハンドルがドラッグ開始時に持っていたローカル座標。
-            const refX = (h.k.includes('w') ? -ax0 : (1 - ax0)) * sz0.w;
-            const refY = (h.k.includes('n') ? -ay0 : (1 - ay0)) * sz0.h;
-            const startLocal = M.apply(invBase, w.x, w.y);
+            const wm = worldMatrix(o, State.time);
             this.drag = {
-              kind: 'scale', handle: h.k, o: o, start: w,
-              sx0: sx0, sy0: sy0, ax0: ax0, ay0: ay0,
-              size: sz0, invBase: invBase, base: base,
-              refX: refX, refY: refY, startLocal: startLocal,
-              startClientX: e.clientX, startClientY: e.clientY
+              kind: h.k === 'rot' ? 'rotate' : 'scale', handle: h.k, o: o, start: w,
+              sx0: getProp(o, 'sx', State.time), sy0: getProp(o, 'sy', State.time),
+              rot0: getProp(o, 'rot', State.time), x0: getProp(o, 'x', State.time), y0: getProp(o, 'y', State.time),
+              origin: { x: wm[4], y: wm[5] },
+              ang0: Math.atan2(w.y - wm[5], w.x - wm[4]), size: objSize(o)
             };
-            // ドラッグ中のブラウザ標準選択を防止。
-            e.preventDefault();
             return;
           }
         }
@@ -1686,7 +1643,7 @@ const Canvas = {
       const objs = selected().filter(o => !o.locked);
       this.drag = {
         kind: 'move', objs: objs.map(o => ({ o: o, x: getProp(o, 'x', State.time), y: getProp(o, 'y', State.time) })),
-        start: w, moved: false, t0: State.time
+        start: w, moved: false
       };
     } else {
       if (!e.shiftKey) { State.selection = []; UI.refreshLayers(); UI.refreshInspector(); }
@@ -1739,58 +1696,17 @@ const Canvas = {
       this.needRender = true; UI.refreshInspector(); return;
     }
     if (d.kind === 'move') {
-      // 移動は「画面/ワールドのX・Y差分」をそのままオブジェクトの
-      // ローカルX・Yへ足してはいけない。親が回転している場合、
-      // ワールドX移動がローカルYへ変換されてしまうため、
-      // ドラッグ開始時に固定した親座標系へ「ベクトル」として逆変換する。
-      const worldDx = w.x - d.start.x;
-      const worldDy = w.y - d.start.y;
-      let dx = worldDx, dy = worldDy;
-      const first = d.objs.length ? d.objs[0].o : null;
-      if (first && first.parentId) {
-        const par = objById(first.parentId);
-        if (par) {
-          let pm = worldMatrix(par, d.t0 == null ? t : d.t0);
-          if (par.type === 'bone') pm = M.mul(pm, M.translate(getProp(par, 'len', d.t0 == null ? t : d.t0), 0));
-          // 平行移動成分を消して、ベクトルだけを逆変換する。
-          const inv = M.invert(pm);
-          const a = M.apply(inv, 0, 0);
-          const b = M.apply(inv, worldDx, worldDy);
-          dx = b.x - a.x;
-          dy = b.y - a.y;
-        }
-      }
-      if (e.shiftKey) {
-        // Shiftの軸固定もワールド座標ではなく、実際に操作している
-        // オブジェクトのローカル軸に対して行う。
-        if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0;
-      }
+      let dx = w.x - d.start.x, dy = w.y - d.start.y;
+      if (e.shiftKey) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
       d.objs.forEach(it => {
         const o = it.o;
-        let odx = dx, ody = dy;
-        if (o.parentId && o.parentId !== (first && first.parentId)) {
-          const par = objById(o.parentId);
-          if (par) {
-            const tt = d.t0 == null ? t : d.t0;
-            let pm = worldMatrix(par, tt);
-            if (par.type === 'bone') pm = M.mul(pm, M.translate(getProp(par, 'len', tt), 0));
-            const inv = M.invert(pm);
-            const a = M.apply(inv, 0, 0), b = M.apply(inv, worldDx, worldDy);
-            odx = b.x - a.x; ody = b.y - a.y;
-          }
-        }
-        let nx = it.x + odx, ny = it.y + ody;
+        let nx = it.x + dx, ny = it.y + dy;
         if (d.objs.length === 1 && !o.parentId) {
           const sp = this.snapPoint(nx, ny, o.id); nx = sp.x; ny = sp.y;
         }
-        setPropValue(o, 'x', t, round(nx, 2));
-        setPropValue(o, 'y', t, round(ny, 2));
+        setPropValue(o, 'x', t, round(nx, 2)); setPropValue(o, 'y', t, round(ny, 2));
       });
-      d.moved = true;
-      this.needRender = true;
-      // ドラッグ中にInspector/Timelineを再構築するとDOM更新で
-      // マウス追従が乱れるため、表示は描画ループだけ更新する。
-      return;
+      d.moved = true; this.needRender = true; UI.refreshInspector(); Timeline.draw(); return;
     }
     if (d.kind === 'pathkey') {
       const o = d.o, dx = w.x - d.start.x, dy = w.y - d.start.y;
@@ -1799,46 +1715,27 @@ const Canvas = {
       this.needRender = true; return;
     }
     if (d.kind === 'rotate') {
+      const ang = Math.atan2(w.y - d.origin.y, w.x - d.origin.x);
       let nr = d.rot0 + deg(ang - d.ang0);
       if (e.shiftKey) nr = Math.round(nr / 15) * 15;
       setPropValue(d.o, 'rot', t, round(nr, 2));
       this.needRender = true; UI.refreshInspector(); return;
     }
     if (d.kind === 'scale') {
-      const o = d.o, h = d.handle;
-      // 重要: d.invBase はドラッグ開始時に固定した逆行列。
-      // 現在の sx/sy を逆変換に使わないため、ドラッグ中に座標系が動くことがない。
-      const p = M.apply(d.invBase, w.x, w.y);
-      let fx = d.sx0, fy = d.sy0;
-      if (h.includes('e') || h.includes('w')) {
-        if (Math.abs(d.refX) > 1e-7) fx = d.sx0 * (p.x / d.refX);
-      }
-      if (h.includes('n') || h.includes('s')) {
-        if (Math.abs(d.refY) > 1e-7) fy = d.sy0 * (p.y / d.refY);
-      }
-      // 中央ハンドルは片軸だけ変更。
-      if (h === 'n' || h === 's') fx = d.sx0;
-      if (h === 'e' || h === 'w') fy = d.sy0;
-      // Shift: 比率を維持したまま、ドラッグ開始時の値を基準に均等拡縮。
-      if (e.shiftKey && (h.length === 2)) {
-        const base = Math.max(1e-7, Math.abs(d.sx0));
-        const f0 = Math.max(1e-7, Math.abs(d.sy0));
-        const rx = Math.abs(fx / base);
-        const ry = Math.abs(fy / f0);
-        const f = Math.max(rx, ry);
-        fx = Math.sign(d.sx0 || 1) * base * f;
-        fy = Math.sign(d.sy0 || 1) * f0 * f;
-      }
-      // 反転は許可するが、ゼロ付近で行列が特異になるのを防ぐ。
-      const eps = 0.0001;
-      if (Math.abs(fx) < eps) fx = fx < 0 ? -eps : eps;
-      if (Math.abs(fy) < eps) fy = fy < 0 ? -eps : eps;
-      setPropValue(o, 'sx', t, round(fx, 5));
-      setPropValue(o, 'sy', t, round(fy, 5));
-      // インスペクタやタイムラインを毎mousemoveで再構築しない。
-      // 描画ループだけを更新し、マウス追従を滑らかにする。
-      this.needRender = true;
-      return;
+      const o = d.o, sz = d.size;
+      const inv = M.invert(worldMatrix(o, t));
+      const p = M.apply(inv, w.x, w.y), p0 = M.apply(inv, d.start.x, d.start.y);
+      const ax = getProp(o, 'ax', t), ay = getProp(o, 'ay', t);
+      const h = d.handle;
+      let fx = 1, fy = 1;
+      const refX = (h.includes('w') ? -ax : (1 - ax)) * sz.w, refY = (h.includes('n') ? -ay : (1 - ay)) * sz.h;
+      if (h.includes('e') || h.includes('w')) fx = refX !== 0 ? (p.x / refX) : 1;
+      if (h.includes('n') || h.includes('s')) fy = refY !== 0 ? (p.y / refY) : 1;
+      if (e.shiftKey && fx !== 1 && fy !== 1) { const f = (Math.abs(fx) + Math.abs(fy)) / 2; fx = f * Math.sign(fx); fy = f * Math.sign(fy); }
+      if (h === 'n' || h === 's') fx = 1; if (h === 'e' || h === 'w') fy = 1;
+      setPropValue(o, 'sx', t, round(d.sx0 * fx, 4));
+      setPropValue(o, 'sy', t, round(d.sy0 * fy, 4));
+      this.needRender = true; UI.refreshInspector(); return;
     }
     if (d.kind === 'ik') { Bones.solveIK(d.o, w); this.needRender = true; UI.refreshInspector(); return; }
     if (d.kind === 'bonecreate') { Bones.updateCreate(w); return; }
@@ -1862,7 +1759,7 @@ const Canvas = {
       }
       if (d.kind === 'move' && d.moved) commit('移動');
       if (d.kind === 'rotate') commit('回転');
-      if (d.kind === 'scale') { commit('スケール'); UI.refreshInspector(); Timeline.draw(); }
+      if (d.kind === 'scale') commit('スケール');
       if (d.kind === 'anchor') commit('アンカー変更');
       if (d.kind === 'pathkey') commit('軌跡の編集');
       if (d.kind === 'ik') commit('IK');
@@ -1906,7 +1803,7 @@ const Timeline = {
     if (!s) { this.rows = rows; return rows; }
     rows.push({ type: 'cam', name: 'カメラ', holder: s.camera, depth: 0, id: 'camera' });
     if (State.expandedObjs['camera']) {
-      ['camx', 'camy', 'zoom', 'shake'].forEach(p => {
+      ['camx', 'camy', 'zoom', 'camrot', 'shake'].forEach(p => {
         if (hasTrack(s.camera, p) || State.expandedObjs['camera_all']) rows.push({ type: 'prop', name: PROP_DEFS[p].label, holder: s.camera, prop: p, depth: 1, id: 'camera.' + p });
       });
     }
@@ -3078,7 +2975,7 @@ const ObjOps = {
     if (o.type === 'sequence') { /* 先頭フレームのみ差し替え */ if (o.frames[0]) o.frames[0].assetId = newAssetId; }
     commit('素材の差し替え');
     UI.refreshInspector(); Canvas.needRender = true;
-    Toast.ok('素材を差し替えました', (old ? old.name : '') + ' → ' + P().assets[newAssetId].name + '\n位置・キーフレームは維持されます。');
+    Toast.ok('素材を差し替えました', (old ? old.name : '') + ' → ' + P().assets[newAssetId].name + '\n位置・回転・キーフレームは維持されます。');
   },
   copy() {
     const sel = selected(); if (!sel.length) return;
@@ -3383,69 +3280,11 @@ const UI = {
   /* ---------- コンテキストメニュー ---------- */
   showContextMenu(x, y, items) {
     const m = $('#ctxmenu');
-    // 右クリックメニューは「表示」だけでなく、項目のクリックを最優先で処理する。
-    // 以前の window.mousedown で即座に閉じる方式だと、mousedown 時点で
-    // .on が外れて display:none になり、その後の click が発火しないブラウザ挙動が起こる。
-    m.innerHTML = items.map((it, i) => it[0] === '---' ? '<div class="msep"></div>' : '<div class="mitem" data-i="' + i + '" role="menuitem" tabindex="0">' + esc(it[0]) + '</div>').join('');
-    m.classList.add('on');
-    m.style.left = Math.max(4, Math.min(x, innerWidth - m.offsetWidth - 8)) + 'px';
-    m.style.top = Math.max(4, Math.min(y, innerHeight - m.offsetHeight - 8)) + 'px';
-
-    let closed = false;
-    const finish = (index) => {
-      if (closed) return;
-      closed = true;
-      cleanup();
-      m.classList.remove('on');
-      const item = items[index];
-      if (!item || item[0] === '---' || typeof item[1] !== 'function') return;
-      // メニューを閉じた後にコマンドを実行するが、例外は必ず捕捉する。
-      try { item[1](); } catch (e) { reportError(e, 'メニュー'); }
-    };
-    const cleanup = () => {
-      window.removeEventListener('mousedown', outsideDown, true);
-      window.removeEventListener('pointerdown', outsideDown, true);
-      window.removeEventListener('keydown', keyDown, true);
-    };
-    const outsideDown = (e) => {
-      // メニュー内部の mousedown / pointerdown では絶対に閉じない。
-      if (m.contains(e.target)) return;
-      closed = true;
-      m.classList.remove('on');
-      cleanup();
-    };
-    const keyDown = (e) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        closed = true;
-        m.classList.remove('on');
-        cleanup();
-      }
-    };
-
-    $$('#ctxmenu .mitem').forEach(el => {
-      const run = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        finish(+el.dataset.i);
-      };
-      // click に加えて pointerup / Enter でも確実に発火させる。
-      el.addEventListener('click', run);
-      el.addEventListener('pointerup', e => {
-        if (e.pointerType === 'mouse' && e.button === 2) return;
-        if (e.pointerType === 'mouse') run(e);
-      });
-      el.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') run(e);
-      });
-    });
-
-    // 外側クリックだけで閉じる。capture でもメニュー内部は除外する。
-    setTimeout(() => {
-      window.addEventListener('mousedown', outsideDown, true);
-      window.addEventListener('pointerdown', outsideDown, true);
-      window.addEventListener('keydown', keyDown, true);
-    }, 0);
+    m.innerHTML = items.map((it, i) => it[0] === '---' ? '<div class="msep"></div>' : '<div class="mitem" data-i="' + i + '">' + esc(it[0]) + '</div>').join('');
+    m.classList.add('on'); m.style.left = Math.min(x, innerWidth - 200) + 'px'; m.style.top = Math.min(y, innerHeight - m.offsetHeight - 10) + 'px';
+    $$('#ctxmenu .mitem').forEach(el => el.onclick = () => { m.classList.remove('on'); try { items[+el.dataset.i][1](); } catch (e) { reportError(e, 'メニュー'); } });
+    const close = () => { m.classList.remove('on'); window.removeEventListener('mousedown', close); };
+    setTimeout(() => window.addEventListener('mousedown', close), 0);
   },
 
   /* ---------- ダイアログ ---------- */
@@ -3488,7 +3327,7 @@ const UI = {
 
     if (isCam) {
       h += sectionStart('camera', '🎥 カメラ');
-      ['camx', 'camy', 'zoom', 'shake'].forEach(p => h += propRow(scene().camera, 'camera', p, t));
+      ['camx', 'camy', 'zoom', 'camrot', 'shake'].forEach(p => h += propRow(scene().camera, 'camera', p, t));
       h += '<div class="hint">カメラの値にもキーを打てます。ズーム・揺れでダイナミックな演出ができます。</div>';
       h += sectionEnd();
     } else if (o) {
@@ -3674,7 +3513,7 @@ const UI = {
     on('#insp-replace', 'onclick', () => {
       const imgs = Object.values(P().assets).filter(a => a.type === 'image');
       if (!imgs.length) { Toast.warn('差し替え先の素材がありません'); return; }
-      this.dialog('素材の差し替え', '<div class="hint">位置・スケール・キーフレーム・親子関係・エフェクトは維持されます。</div><select id="rep-sel" size="10" style="height:auto">' +
+      this.dialog('素材の差し替え', '<div class="hint">位置・回転・スケール・キーフレーム・親子関係・エフェクトは維持されます。</div><select id="rep-sel" size="10" style="height:auto">' +
         imgs.map(a => '<option value="' + a.id + '"' + (a.id === o.assetId ? ' selected' : '') + '>' + esc(a.name) + ' (' + a.w + '×' + a.h + ')</option>').join('') + '</select>',
         [['キャンセル', null], ['差し替える', () => ObjOps.replaceAsset(o, $('#rep-sel').value), true]]);
     });
@@ -4312,6 +4151,11 @@ const NLMotion = {
           setKey(o, 'sx', t0, sx, r.ease); setKey(o, 'sy', t0, sy, r.ease);
           setKey(o, 'sx', mid, round(sx * op.f, 4), r.ease); setKey(o, 'sy', mid, round(sy * op.f, 4), r.ease);
           if (r.back) { setKey(o, 'sx', end, sx, r.ease); setKey(o, 'sy', end, sy, r.ease); }
+        } else if (op.kind === 'rotate') {
+          const rr = getProp(o, 'rot', t0);
+          setKey(o, 'rot', t0, rr, r.ease);
+          setKey(o, 'rot', mid, round(rr + op.deg, 2), r.ease);
+          if (r.back) setKey(o, 'rot', end, rr, r.ease);
         } else if (op.kind === 'fade') {
           setKey(o, 'opacity', t0, op.from, r.ease);
           setKey(o, 'opacity', t0 + dur, op.to, r.ease);
@@ -4616,7 +4460,7 @@ function helpDialog() {
   7. スペースキーで再生<br><br>
   <b>パーツ分けアニメ</b><br>
   頭・腕・体などのPNGを配置し、レイヤーパネルで子を親へドラッグすると親子関係になります。
-  アンカーツール（A）で腕の付け根に基準点を移すと、肩を軸に腕が回ります。<br><br>
+  アンカーツール（A）で腕の付け根に回転中心を移すと、肩を軸に腕が回ります。<br><br>
   <b>ボーン</b><br>
   ボーンツール（B）でドラッグして作成。PNGをボーンへドラッグして関連付けると、ボーンの回転で動きます。
   ボーンを選んでIKをONにすると、先端をドラッグするだけで2ボーンIKが解けます。OFFならFKです。<br><br>
@@ -4736,13 +4580,6 @@ function bindUI() {
   window.addEventListener('beforeunload', e => { if (State.dirty) { e.preventDefault(); e.returnValue = ''; } });
   try { const sc = localStorage.getItem('k2d_shortcuts'); if (sc) { SHORTCUTS = JSON.parse(sc); buildMenus(); } } catch (e) { }
 }
-
-// ページを離れる直前では非同期処理が中断されることがあるため、
-// hidden 時に先回りして自動保存する。GitHub PagesでもIndexedDBが利用できる。
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') AutoSave.run(true).catch(() => {});
-});
-window.addEventListener('pagehide', () => { AutoSave.run(true).catch(() => {}); });
 
 async function boot() {
   Canvas.init(); Timeline.init(); GraphEditor.init();
